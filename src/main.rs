@@ -106,7 +106,10 @@ async fn handler(
         }
     };
 
-    tracing::debug!("raw output: {}", String::from_utf8_lossy(&command.stdout));
+    tracing::debug!("stdout: {}", String::from_utf8_lossy(&command.stdout));
+    if !command.stderr.is_empty() {
+        tracing::error!("stderr: {}", String::from_utf8_lossy(&command.stderr));
+    }
 
     let response: Vec<AutoUpdateReponse> = if command.stdout.starts_with("[".as_bytes()) {
         serde_json::from_slice(&command.stdout).expect("failed to parse")
