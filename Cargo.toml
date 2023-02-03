@@ -2,6 +2,8 @@
 edition = "2021"
 name = "podman-autoupdate-hook"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
+description = "A webhook server to manually trigger podman auto-update"
 
 [dependencies]
 axum = "0.6.4"
