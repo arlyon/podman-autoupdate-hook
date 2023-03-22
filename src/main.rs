@@ -1,13 +1,16 @@
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::State,
+    extract::{BodyStream, State},
+    headers::{authorization::Bearer, Authorization, Header, HeaderName},
     http::{Request, StatusCode},
-    routing::get,
-    Json, Router,
+    routing::post,
+    Json, Router, TypedHeader,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, process::ExitStatus};
+use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use tokio::{process::Command, signal};
 use tower::{BoxError, ServiceBuilder};
 use tower_governor::{
@@ -20,12 +23,18 @@ struct Opt {
     #[clap(short, long, default_value_t = 5000)]
     port: u16,
 
-    #[clap(long)]
-    token: Option<String>,
+    #[clap(subcommand)]
+    command: Option<TokenCommand>,
+}
+
+#[derive(Subcommand, Clone, Eq, PartialEq)]
+enum TokenCommand {
+    Github { secret: String },
+    Token { bearer: String },
 }
 
 #[derive(Clone)]
-struct Token(Option<String>);
+struct Token(Option<TokenCommand>);
 
 #[tokio::main]
 async fn main() {
@@ -45,8 +54,8 @@ async fn main() {
 
     // build our application with a route
     let app = Router::new()
-        .route("/hook", get(handler))
-        .with_state(Token(opt.token))
+        .route("/hook", post(handler))
+        .with_state(Token(opt.command))
         .layer(
             ServiceBuilder::new()
                 // this middleware goes above `GovernorLayer` because it will receive
@@ -61,7 +70,7 @@ async fn main() {
 
     // run it
     let addr = SocketAddr::from(([0, 0, 0, 0], opt.port));
-    println!("listening on {}", addr);
+    tracing::info!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
@@ -69,15 +78,71 @@ async fn main() {
         .unwrap();
 }
 
+struct GithubSignature256 {
+    signature: String,
+}
+
+impl Header for GithubSignature256 {
+    fn name() -> &'static axum::headers::HeaderName {
+        static SIGNATURE_HEADER: HeaderName = HeaderName::from_static("x-hub-signature-256");
+        &SIGNATURE_HEADER
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
+    where
+        Self: Sized,
+        I: Iterator<Item = &'i axum::http::HeaderValue>,
+    {
+        values
+            .next()
+            .map(|v| {
+                let v = v.to_str().map_err(|_| axum::headers::Error::invalid())?;
+                Ok(GithubSignature256 {
+                    signature: v.to_string(),
+                })
+            })
+            .unwrap_or(Err(axum::headers::Error::invalid()))
+    }
+
+    fn encode<E: Extend<axum::http::HeaderValue>>(&self, _values: &mut E) {
+        unimplemented!()
+    }
+}
+
 async fn handler(
     State(Token(token)): State<Token>,
-    auth: Option<axum_auth::AuthBearer>,
+    auth: Option<TypedHeader<Authorization<Bearer>>>,
+    github_signature: Option<TypedHeader<GithubSignature256>>,
+    mut stream: BodyStream,
 ) -> Result<Json<Vec<AutoUpdateReponse>>, (StatusCode, ())> {
-    match (token, auth) {
-        (Some(t1), Some(t2)) if t1 == t2.0 => {}
-        (Some(_), _) => {
+    match (token, auth, github_signature) {
+        (Some(TokenCommand::Token { bearer: t1 }), Some(TypedHeader(t2)), None)
+            if t1 == t2.token() => {}
+        (Some(TokenCommand::Token { .. }), _, _) => {
             tracing::debug!("token mismatch");
             return Err((StatusCode::UNAUTHORIZED, ()));
+        }
+        (
+            Some(TokenCommand::Github { secret }),
+            None,
+            Some(TypedHeader(GithubSignature256 { signature })),
+        ) => {
+            let mut hasher = Sha256::new();
+            hasher.update(secret);
+            while let Some(Ok(b)) = stream.next().await {
+                hasher.update(b);
+            }
+
+            let (_, signature_exp) = signature
+                .split_once('=')
+                .ok_or((StatusCode::BAD_REQUEST, ()))?;
+
+            let signature = hex::encode(hasher.finalize());
+
+            if signature != signature_exp {
+                tracing::debug!("github signature mismatch");
+                return Err((StatusCode::UNAUTHORIZED, ()));
+            }
         }
         _ => {}
     }
@@ -179,7 +244,7 @@ impl KeyExtractor for UserToken {
             .get("Authorization")
             .and_then(|token| token.to_str().ok())
             .and_then(|token| token.strip_prefix("Bearer "))
-            .and_then(|token| Some(token.trim().to_owned()))
+            .map(|token| token.trim().to_owned())
             .unwrap_or_default())
     }
 
