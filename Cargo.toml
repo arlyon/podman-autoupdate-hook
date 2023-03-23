@@ -8,6 +8,7 @@ description = "A webhook server to manually trigger podman auto-update"
 [dependencies]
 axum = { version = "0.6.4", features = ["headers"] }
 axum-auth = "0.4.0"
+axum_either = "0.1.0"
 clap = { version = "4.1.4", features = ["derive", "env"] }
 futures-util = "0.3.27"
 hex = "0.4.3"

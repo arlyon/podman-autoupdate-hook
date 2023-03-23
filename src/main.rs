@@ -1,13 +1,16 @@
+mod headers;
+
 use axum::{
     error_handling::HandleErrorLayer,
     extract::{BodyStream, State},
-    headers::{authorization::Bearer, Authorization, Header, HeaderName},
+    headers::{authorization::Bearer, Authorization},
     http::{Request, StatusCode},
     routing::post,
     Json, Router, TypedHeader,
 };
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use headers::{GithubEvent, GithubSignature256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -29,7 +32,7 @@ struct Opt {
 
 #[derive(Subcommand, Clone, Eq, PartialEq)]
 enum TokenCommand {
-    Github { secret: String },
+    Github { secret: String, events: Vec<String> },
     Token { bearer: String },
 }
 
@@ -41,6 +44,16 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let opt = Opt::parse();
+
+    match opt.command.as_ref() {
+        Some(TokenCommand::Token { .. }) => {
+            tracing::info!("accepting authorization header");
+        }
+        Some(TokenCommand::Github { events, .. }) => {
+            tracing::info!("accepting github events: {:?}", events);
+        }
+        _ => {}
+    }
 
     let governor_conf = Box::new(
         GovernorConfigBuilder::default()
@@ -71,6 +84,7 @@ async fn main() {
     // run it
     let addr = SocketAddr::from(([0, 0, 0, 0], opt.port));
     tracing::info!("listening on {}", addr);
+
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
@@ -78,54 +92,25 @@ async fn main() {
         .unwrap();
 }
 
-struct GithubSignature256 {
-    signature: String,
-}
-
-impl Header for GithubSignature256 {
-    fn name() -> &'static axum::headers::HeaderName {
-        static SIGNATURE_HEADER: HeaderName = HeaderName::from_static("x-hub-signature-256");
-        &SIGNATURE_HEADER
-    }
-
-    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
-    where
-        Self: Sized,
-        I: Iterator<Item = &'i axum::http::HeaderValue>,
-    {
-        values
-            .next()
-            .map(|v| {
-                let v = v.to_str().map_err(|_| axum::headers::Error::invalid())?;
-                Ok(GithubSignature256 {
-                    signature: v.to_string(),
-                })
-            })
-            .unwrap_or(Err(axum::headers::Error::invalid()))
-    }
-
-    fn encode<E: Extend<axum::http::HeaderValue>>(&self, _values: &mut E) {
-        unimplemented!()
-    }
-}
-
 async fn handler(
     State(Token(token)): State<Token>,
     auth: Option<TypedHeader<Authorization<Bearer>>>,
     github_signature: Option<TypedHeader<GithubSignature256>>,
+    github_event: Option<TypedHeader<GithubEvent>>,
     mut stream: BodyStream,
 ) -> Result<Json<Vec<AutoUpdateReponse>>, (StatusCode, ())> {
-    match (token, auth, github_signature) {
-        (Some(TokenCommand::Token { bearer: t1 }), Some(TypedHeader(t2)), None)
+    match (token, auth, github_signature, github_event) {
+        (Some(TokenCommand::Token { bearer: t1 }), Some(TypedHeader(t2)), None, None)
             if t1 == t2.token() => {}
-        (Some(TokenCommand::Token { .. }), _, _) => {
+        (Some(TokenCommand::Token { .. }), _, _, _) => {
             tracing::debug!("token mismatch");
             return Err((StatusCode::UNAUTHORIZED, ()));
         }
         (
-            Some(TokenCommand::Github { secret }),
+            Some(TokenCommand::Github { secret, events }),
             None,
-            Some(TypedHeader(GithubSignature256 { signature })),
+            Some(TypedHeader(GithubSignature256(signature))),
+            event,
         ) => {
             let mut hasher = Sha256::new();
             hasher.update(secret);
@@ -143,6 +128,23 @@ async fn handler(
                 tracing::debug!("github signature mismatch");
                 return Err((StatusCode::UNAUTHORIZED, ()));
             }
+
+            match (&events[..], event) {
+                ([], _) => {}
+                (_, None) => {
+                    tracing::debug!("missing github event header");
+                    return Err((StatusCode::BAD_REQUEST, ()));
+                }
+                (e, Some(TypedHeader(GithubEvent(event)))) if !e.contains(&event) => {
+                    tracing::debug!("github event mismatch, ignoring");
+                    return Err((StatusCode::OK, ()));
+                }
+                _ => {}
+            }
+        }
+        (Some(TokenCommand::Github { .. }), _, None, _) => {
+            tracing::debug!("missing github signature header");
+            return Err((StatusCode::BAD_REQUEST, ()));
         }
         _ => {}
     }
